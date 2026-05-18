@@ -19,9 +19,48 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 struct ScanEntry {
     char     mac[18];
     int      rssi;
-    char     name[24];
+    char     name[24];   /* prawdziwa nazwa BLE jesli urzadzenie ja nadaje */
+    char     vendor[16]; /* domyslana etykieta z manufacturer data */
     uint32_t lastSeenMs;
 };
+
+/* Mapowanie Bluetooth SIG Company ID -> czytelna etykieta.
+   Pelna lista: https://www.bluetooth.com/specifications/assigned-numbers/ */
+static const char *guessVendor(uint16_t cid, const uint8_t *data, size_t len) {
+    /* Apple ma wlasny "Continuity" protokol — pierwszy bajt po company ID to typ */
+    if (cid == 0x004C && len >= 3) {
+        uint8_t type = data[2];
+        if (type == 0x02 && len >= 4 && data[3] == 0x15) return "iBeacon";
+        if (type == 0x07) return "AirPods";
+        if (type == 0x09) return "AirPrint";
+        if (type == 0x10) return "Apple nearby";
+        if (type == 0x12) return "Find My";
+        if (type == 0x16) return "Find My";
+        return "Apple";
+    }
+    switch (cid) {
+        case 0x0006: return "Microsoft";
+        case 0x00E0: return "Google";
+        case 0x0075: return "Samsung";
+        case 0x0087: return "Garmin";
+        case 0x038F: return "Xiaomi";
+        case 0x0157: return "Mi Band";
+        case 0x0499: return "RuuviTag";
+        case 0x05A7: return "Sonos";
+        case 0x004F: return "Tile";
+        case 0x0059: return "Nordic";
+        case 0x000D: return "TI";
+        case 0x000F: return "Broadcom";
+        case 0x0001: return "Ericsson";
+        case 0x0002: return "Intel";
+        case 0x0046: return "Sony";
+        case 0x0131: return "Cypress";
+        case 0x0118: return "Withings";
+        case 0x009E: return "Bose";
+        case 0x0171: return "Amazon";
+        default: return nullptr;
+    }
+}
 
 static BLEScan          *bleScan = nullptr;
 static ScanEntry         entries[MAX_SCAN_RESULTS];
@@ -32,11 +71,32 @@ static uint32_t          lastDisplayUpdate = 0;
 /* ============== zarzadzanie lista (callback BLE + main task uzywaja mutexa) ============== */
 
 static void addOrUpdateEntry(BLEAdvertisedDevice &d) {
+    /* wyciagamy dane PRZED zajeciem mutexa, zeby trzymac go jak najkrocej */
     char mac[18];
     strncpy(mac, d.getAddress().toString().c_str(), 17);
     mac[17] = '\0';
     int rssi = d.getRSSI();
-    bool hasName = d.haveName();
+
+    char nameBuf[24];
+    nameBuf[0] = '\0';
+    if (d.haveName()) {
+        strncpy(nameBuf, d.getName().c_str(), 23);
+        nameBuf[23] = '\0';
+    }
+
+    char vendorBuf[16];
+    vendorBuf[0] = '\0';
+    if (d.haveManufacturerData()) {
+        std::string md = d.getManufacturerData();
+        if (md.size() >= 2) {
+            uint16_t cid = (uint8_t)md[0] | ((uint8_t)md[1] << 8);
+            const char *v = guessVendor(cid, (const uint8_t *)md.data(), md.size());
+            if (v) {
+                strncpy(vendorBuf, v, 15);
+                vendorBuf[15] = '\0';
+            }
+        }
+    }
 
     xSemaphoreTake(entriesMutex, portMAX_DELAY);
 
@@ -51,14 +111,13 @@ static void addOrUpdateEntry(BLEAdvertisedDevice &d) {
         }
         idx = entryCount++;
         strcpy(entries[idx].mac, mac);
-        entries[idx].name[0] = '\0';
+        entries[idx].name[0]   = '\0';
+        entries[idx].vendor[0] = '\0';
     }
     entries[idx].rssi = rssi;
     entries[idx].lastSeenMs = millis();
-    if (hasName) {
-        strncpy(entries[idx].name, d.getName().c_str(), 23);
-        entries[idx].name[23] = '\0';
-    }
+    if (nameBuf[0])   strcpy(entries[idx].name,   nameBuf);
+    if (vendorBuf[0]) strcpy(entries[idx].vendor, vendorBuf);
 
     xSemaphoreGive(entriesMutex);
 }
@@ -151,11 +210,12 @@ static void renderList() {
     for (int i = 0; i < rows; i++) {
         const char *label;
         if (snap[i].name[0]) {
-            label = snap[i].name;                /* nazwa jest = priorytet */
+            label = snap[i].name;          /* 1. prawdziwa nazwa BLE */
+        } else if (snap[i].vendor[0]) {
+            label = snap[i].vendor;        /* 2. domyslany producent */
         } else {
-            label = snap[i].mac + 3;             /* skrocony MAC: "BB:CC:DD:EE:FF" */
+            label = snap[i].mac + 3;       /* 3. skrocony MAC "BB:CC:DD:EE:FF" */
         }
-        /* "1 LabelDoCzternastu %4d" — RSSI dosuniete do prawej */
         snprintf(line, sizeof(line), "%d %-14.14s %4d",
                  i + 1, label, snap[i].rssi);
         u8g2.drawStr(0, 18 + i * 8, line);
